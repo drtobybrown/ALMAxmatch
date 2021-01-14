@@ -114,7 +114,7 @@ class archiveSearch:
         self.queryResultsNoNED = dict()
         self.queryResultsNoNEDz = dict()
 
-    def runQueries(self, public=False, science=False, **kwargs):
+    def runQueries(self, public=None, science=False, scan_intent = 'TARGET', **kwargs):
         """Run requested queries.
 
         Parameters
@@ -124,12 +124,11 @@ class archiveSearch:
         science : bool
             Return only data marked as "science" in the archive?
         kwargs : dict
-            Keywords that are accepted by the ALMA archive system. You can look
-            these up by examining the forms at http://almascience.org/aq.
-            Passed to `astroquery.alma.Alma.query`. If archiveSearch was
-            initialized with the `targets` argument then "source_name_resolver"
-            and "ra_dec" cannot be used here.
-
+            Keywords that are accepted by the ALMA archive system. These keywords are part
+             of the ALMA ObsCore model, an IVOA standard for metadata representation
+             (3rd column). They were also present in original ALMA Web form and, for
+             backwards compatibility can be accessed with their old names (2nd column).
+        
         Also does some work on the result tables to put data into more useful
         forms. This includes:
 
@@ -137,11 +136,37 @@ class archiveSearch:
             strings to np.datetime64 objects
         """
         if self.isObjectQuery == False:
-            payload = dict()
-            self.queryResults['All sky'] = Alma.query(payload,
-                                                      public=public,
-                                                      science=science,
-                                                      **kwargs)
+            
+            # using query_tap() for robustness, speed, and flexibility. 
+            # See ISSUE with searching frequency ranges below
+            # I couldn't get query() to complete with large freq ranges
+            freq_hi_s, _, freq_lo_s = kwargs['frequency'].split()
+
+            sql_query = ("select * from ivoa.ObsCore where "
+                         "(science_observation='T') "
+                         "and (dataproduct_type = 'cube') "
+                         "and (scan_intent = 'TARGET') "
+                         "and (frequency between {:} and {:})".format(freq_hi_s, freq_lo_s))
+
+            self.queryResults['All sky'] = Alma.query_tap(sql_query).to_table()
+#             payload = {} # empty dict
+#             print(kwargs)
+#             self.queryResults['All sky'] = Alma.query(payload,
+#                                                       public=public,
+#                                                       science=science,
+#                                                       # legacy_columns=True,
+#                                                       **kwargs)
+            
+#             # scan_intent is not a valid query ObsCore keyword 
+#             # so has to be sorted after - can be used in query_tap()
+#             if scan_intent == 'TARGET': 
+#                 idx = self.queryResults['All sky']['scan_intent'] == 'TARGET'
+#                 self.queryResults['All sky'] = self.queryResults['All sky'][idx]
+                
+#                 # fudged to only return cubes because I just need it to work quickly
+#                 idx = self.queryResults['All sky']['dataproduct_type'] == 'cube' 
+#                 self.queryResults['All sky'] = self.queryResults['All sky'][idx]
+                
         else:
             if 'source_name_resolver' in kwargs:
                 msg = '"source_name_resolver" cannot be used when ' \
@@ -182,7 +207,7 @@ class archiveSearch:
         self._parsePolarizations()
 
     def runQueriesWithLines(self, restFreqs, redshiftRange=(0, 1000),
-                            lineNames=[], public=False, science=False,
+                            lineNames=[], public=False, science=False, scan_intent = 'TARGET',
                             **kwargs):
         """Run queries for spectral lines.
 
@@ -216,7 +241,7 @@ class archiveSearch:
 
         Matching against NED to find source redshifts is attempted first with
         the ALMA archive coordinates, searching in NED with a search radius of
-        30 arcseconds and only keeping results with type G (galaxy). If more
+        10 arcseconds and only keeping results with type G (galaxy). If more
         or less than one NED result matches the positional search then a search
         is attempted based on a sanitized version of the ALMA archive source
         name. If there is no match to name then the ALMA observation is placed
@@ -247,11 +272,22 @@ class archiveSearch:
         redshiftRange.sort()
 
         # define frequency range from lines and redshifts
-        lowFreq = self._observedFreq(restFreqs[0], redshiftRange[1])
-        highFreq = self._observedFreq(restFreqs[-1], redshiftRange[0])
+        # ISSUE: Because "Frequency" in the ALMA data model is the mean of the spws,
+        # setting an upper and lower frequency limit equal to line at that redshift will remove 
+        # galaxies where some spws are outside this range
+        # I've hard coded an expanded frequency search, which calculates the mean of freq limits 
+        # and freq @ highest/lowest possible spw frequency
+        lowFreq_line = self._observedFreq(restFreqs[0], redshiftRange[1])
+        highFreq_line = self._observedFreq(restFreqs[-1], redshiftRange[0])
+        
+        lowFreq = np.mean([lowFreq_line, lowFreq_line-20]) # 20 GHz is LO width @ band 6
+        highFreq = np.mean([highFreq_line, highFreq_line+20]) # 20 GHz is LO width @ band 6
+        
         freqLimits = '{:} .. {:}'.format(lowFreq, highFreq)
+        
+        print('search frequency range = {} GHz'.format(freqLimits))
 
-        self.runQueries(public=public, science=science, frequency=freqLimits,
+        self.runQueries(public=public, science=science, frequency=freqLimits, scan_intent=scan_intent,
                         **kwargs)
 
         for target in self.targets:
@@ -260,8 +296,8 @@ class archiveSearch:
 
                 # sanitize ALMA source names
                 safeNames = currTable['target_name']
-                safeNames = np.char.replace(safeNames, b' ', b'')
-                safeNames = np.char.replace(safeNames, b'_', b'')
+                safeNames = np.char.replace(safeNames, ' ', '')
+                safeNames = np.char.replace(safeNames, '_', '')
                 safeNames = np.char.upper(safeNames)
                 currTable['ALMA sanitized source name'] = safeNames
 
@@ -277,13 +313,13 @@ class archiveSearch:
                     # coordinate search
                     try:
                         nedSearch = Ned.query_region(searchCoords[i],
-                                                     radius=30*u.arcsec,
+                                                     radius=10*u.arcsec,
                                                      equinox='J2000.0')
                     except Exception:
                         pass
 
                     # only want galaxies
-                    typeInds = np.where(nedSearch['Type'] != b'G')
+                    typeInds = np.where(nedSearch['Type'] != 'G')
                     nedSearch.remove_rows(typeInds)
 
                     # try name search when not just one coordinate match
